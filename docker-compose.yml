@@ -10,6 +10,13 @@ services:
       DICOM_REMAP_MAX_FILES: "20"
       DICOM_REMAP_MAX_TOTAL_BYTES: "16777216"
       DICOM_REMAP_LOCK_WAIT: "60"
+      # 销毁线程删除失败后的重试间隔（秒）
+      DICOM_REMAP_DESTROY_RETRY_SECONDS: "2"
+      # 演示钩子：人为放慢转换与下载，便于在浏览器演示
+      # “慢转换/慢下载期间发起销毁、在途操作优雅退出、重启后续办”。
+      # 生产环境置 0 即可关闭。
+      DICOM_REMAP_SLOW_CONVERT_SECONDS: "2"
+      DICOM_REMAP_SLOW_DOWNLOAD_CHUNK_SECONDS: "1"
       GENERATE_SAMPLES: "true"
     volumes:
       - dicom-data:/data

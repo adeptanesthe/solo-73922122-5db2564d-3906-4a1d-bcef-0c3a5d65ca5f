@@ -95,6 +95,10 @@ def main() -> int:
     # 各模块持有的是同一个 settings 引用；frozen dataclass 用 object.__setattr__
     # 绕过冻结，db_path/staging_dir/published_dir 均为 property，会立即反映新目录。
     object.__setattr__(settings, "data_dir", tmp)
+    # 验收脚本全速运行：关闭容器里可能开启的慢转换/慢下载演示钩子
+    object.__setattr__(settings, "slow_convert_seconds", 0.0)
+    object.__setattr__(settings, "slow_download_chunk_seconds", 0.0)
+    object.__setattr__(settings, "destroy_retry_seconds", 0.2)
 
     port = 18080
     ServerThread(port).start()
@@ -233,6 +237,64 @@ def main() -> int:
         many = [big] * 21
         r_many = _upload(client, base, proj_a, many)
         check(r_many.status_code in (400, 413), f"超过 20 份被拒绝 (HTTP {r_many.status_code})")
+
+        print("== 场景 7：项目销毁（受理 -> 闸门 -> 物理删除 -> 墓碑） ==")
+        doomed_batches = client.get(f"{base}/api/batches", params={"project_id": proj_b}).json()
+        check(len(doomed_batches) == 1, "销毁前项目 B 存在已发布批次")
+        doomed_batch = doomed_batches[0]["id"]
+        doomed_zip = tmp / "published" / f"{doomed_batch}.zip"
+        check(doomed_zip.is_file(), "销毁前项目 B 的 ZIP 存在")
+
+        # 阻塞物理删除，使“受理后、删除完成前”的闸门检查确定化
+        from app import destroy as destroy_mod
+        gate = threading.Event()
+        real_delete = destroy_mod._delete_project_files
+
+        def blocked_delete(pid):
+            gate.wait(timeout=15)
+            return real_delete(pid)
+
+        destroy_mod._delete_project_files = blocked_delete
+        try:
+            r = client.post(f"{base}/api/projects/{proj_b}/destroy")
+            check(r.status_code == 202, f"销毁受理 (HTTP {r.status_code})")
+            r2 = client.post(f"{base}/api/projects/{proj_b}/destroy")
+            check(r2.status_code == 202 and r2.json()["requested_at"] == r.json()["requested_at"],
+                  "重复请求跟随同一次销毁（幂等）")
+
+            r = _upload(client, base, proj_b, sorted((samples / "batch_a").glob("*.dcm")))
+            check(r.status_code in (409, 410), f"受理后新上传被拒绝 (HTTP {r.status_code})")
+            r = client.get(f"{base}/api/batches/{doomed_batch}/download")
+            check(r.status_code == 410, f"受理后新下载被拒绝 (HTTP {r.status_code})")
+            r = client.get(f"{base}/api/batches", params={"project_id": proj_b})
+            check(r.status_code == 410, "受理后批次列表不再可见")
+            r = client.get(f"{base}/api/mappings", params={"project_id": proj_b})
+            check(r.status_code == 410, "受理后映射列表不再可见")
+        finally:
+            gate.set()
+            destroy_mod._delete_project_files = real_delete
+
+        final = None
+        for _ in range(100):
+            state = client.get(f"{base}/api/projects/{proj_b}/destroy").json()
+            if state["status"] == "DESTROYED":
+                final = state
+                break
+            time.sleep(0.1)
+        check(final is not None and final["finished_at"], "销毁在时限内完成（DESTROYED）")
+        check(not doomed_zip.exists(), "项目 ZIP 已物理删除")
+        check(not (tmp / "staging" / doomed_batch).exists(), "项目暂存目录已删除")
+        projects_after = client.get(f"{base}/api/projects").json()
+        check(all(p["id"] != proj_b for p in projects_after), "已销毁项目从项目列表移除")
+        check(all(b["project_id"] != proj_b for b in client.get(f"{base}/api/batches").json()),
+              "已销毁项目批次不出现在全局批次列表")
+        check(all(m["project_id"] != proj_b for m in client.get(f"{base}/api/mappings").json()),
+              "已销毁项目映射不出现在全局映射列表")
+        tombs = client.get(f"{base}/api/destructions").json()
+        check(any(d["project_id"] == proj_b and d["status"] == "DESTROYED" for d in tombs),
+              "销毁墓碑保留项目 ID 与销毁状态")
+        r = client.get(f"{base}/api/batches/{batch_a_id}/download")
+        check(r.status_code == 200, "其他项目（A）下载不受影响")
 
     print()
     if failures:

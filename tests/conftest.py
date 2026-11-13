@@ -32,6 +32,10 @@ def client(tmp_path, monkeypatch):
     import app.db as db_module
 
     config_module.reload_settings()
+    # 演示用的慢速钩子（慢转换/慢下载）不影响测试速度；销毁重试间隔调小
+    object.__setattr__(config_module.settings, "slow_convert_seconds", 0.0)
+    object.__setattr__(config_module.settings, "slow_download_chunk_seconds", 0.0)
+    object.__setattr__(config_module.settings, "destroy_retry_seconds", 0.1)
     db_module.init_db()
     from app.pipeline import recover_on_startup
     recover_on_startup()

@@ -49,6 +49,12 @@
   .PUBLISHED { background: rgba(34,197,94,.15); color: var(--ok); }
   .PENDING { background: rgba(245,158,11,.15); color: var(--warn); }
   .FAILED { background: rgba(239,68,68,.15); color: var(--err); }
+  .DESTROYING { background: rgba(245,158,11,.15); color: var(--warn); }
+  .DESTROYED { background: rgba(148,163,184,.18); color: var(--muted); }
+  button.danger { background: var(--err); border-color: var(--err); color: #450a0a; }
+  .destroy-note { font-size: 12px; color: var(--muted); margin: 10px 0; }
+  #destroyProgress { margin-top: 12px; font-size: 13px; display: none; padding: 10px 12px;
+    border-radius: 8px; background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.4); }
   .msg { margin-top: 12px; padding: 10px 12px; border-radius: 8px; font-size: 13px; display: none; }
   .msg.ok { display: block; background: rgba(34,197,94,.12); border: 1px solid rgba(34,197,94,.4); }
   .msg.err { display: block; background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.4); }
@@ -134,12 +140,39 @@
       <div id="detail" class="hint">点击批次行查看详情与下载链接</div>
     </section>
   </div>
+
+  <section class="card">
+    <h2>④ 项目销毁（研究结束后永久清理）</h2>
+    <p class="destroy-note">
+      受理后立即拒绝该项目的新上传与下载，批次与映射不再对外可见；此前开始的转换不得再发布，
+      已获准的下载可完成。等待在途转换退出、下载关闭后，后台线程永久删除该项目全部 ZIP、
+      暂存、批次与映射，仅保留项目 ID 与销毁状态。删除失败会自动重试，服务重启后自动续办。
+      <strong>此操作不可撤销。</strong>
+    </p>
+    <div class="row">
+      <div style="flex:0 0 auto;">
+        <button class="danger" id="destroyBtn" type="button">永久销毁当前选中项目</button>
+      </div>
+      <div style="flex:0 0 auto;">
+        <button class="secondary" id="refreshDestroyBtn" type="button">刷新销毁记录</button>
+      </div>
+    </div>
+    <div id="destroyProgress"></div>
+    <div class="scroll" style="margin-top:14px; max-height:240px;">
+      <table>
+        <thead><tr><th>项目</th><th>状态</th><th>受理时间</th><th>完成时间</th><th>在途等待</th><th>重试/错误</th></tr></thead>
+        <tbody id="destructionRows"><tr><td colspan="6">暂无销毁记录</td></tr></tbody>
+      </table>
+    </div>
+  </section>
 </main>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let meta = { max_files: 20, max_total_bytes: 16 * 1024 * 1024 };
 let pickedFiles = [];
+let projectsCache = [];
+const destroyPollers = {};
 
 const KIND_LABEL = {
   patient_id: "PatientID", study_uid: "Study UID",
@@ -165,12 +198,30 @@ async function loadMeta() {
     `单批最多 ${meta.max_files} 份，合计 ≤ ${meta.max_total_mib} MiB；坏文件或超限整批拒绝`;
 }
 
+function currentProject() {
+  return projectsCache.find(p => p.id === $("project").value) || null;
+}
+
 async function loadProjects(selectId) {
-  const projects = await api("/api/projects");
+  projectsCache = await api("/api/projects");
   const sel = $(selectId);
   const current = sel.value;
-  sel.innerHTML = projects.map(p => `<option value="${p.id}">${p.name}</option>`).join("");
-  if (current && projects.some(p => p.id === current)) sel.value = current;
+  sel.innerHTML = projectsCache.map(p =>
+    `<option value="${p.id}">${p.name}${p.destruction_status ? "（销毁中）" : ""}</option>`
+  ).join("");
+  if (current && projectsCache.some(p => p.id === current)) sel.value = current;
+  updateDestroyGate();
+}
+
+// 销毁中的项目：禁止上传，提示状态；销毁按钮变为幂等“跟随/查看进度”
+function updateDestroyGate() {
+  const p = currentProject();
+  const destroying = !!(p && p.destruction_status);
+  $("uploadBtn").disabled = destroying || pickedFiles.length === 0;
+  $("destroyBtn").textContent = destroying ? "该项目正在销毁…查看进度" : "永久销毁当前选中项目";
+  if (destroying) {
+    showMsg($("uploadMsg"), false, "该项目已受理销毁：新上传与下载已关闭，批次与映射不再可见");
+  }
 }
 
 function renderPicked() {
@@ -180,7 +231,7 @@ function renderPicked() {
     : "";
   $("sizeHint").textContent =
     `${pickedFiles.length} 份 / 合计 ${(total / (1024 * 1024)).toFixed(2)} MiB`;
-  $("uploadBtn").disabled = pickedFiles.length === 0;
+  updateDestroyGate();
 }
 
 $("drop").addEventListener("click", () => $("fileInput").click());
@@ -225,14 +276,20 @@ $("uploadBtn").addEventListener("click", async () => {
   } catch (err) {
     showMsg($("uploadMsg"), false, "入库失败（无部分批次、已有映射未改动）：" + err.message);
   } finally {
-    $("uploadBtn").disabled = pickedFiles.length === 0;
+    updateDestroyGate();
   }
 });
 
 async function loadBatches() {
   const projectId = $("project").value;
-  const rows = await api(`/api/batches?project_id=${encodeURIComponent(projectId)}`);
   const tbody = $("batchRows");
+  let rows;
+  try {
+    rows = await api(`/api/batches?project_id=${encodeURIComponent(projectId)}`);
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="4">${err.message}</td></tr>`;
+    return;
+  }
   if (!rows.length) { tbody.innerHTML = '<tr><td colspan="4">暂无数据</td></tr>'; return; }
   tbody.innerHTML = rows.map(b => `
     <tr style="cursor:pointer" data-batch="${b.id}">
@@ -248,8 +305,14 @@ async function loadBatches() {
 
 async function loadMappings() {
   const projectId = $("project").value;
-  const rows = await api(`/api/mappings?project_id=${encodeURIComponent(projectId)}`);
   const tbody = $("mappingRows");
+  let rows;
+  try {
+    rows = await api(`/api/mappings?project_id=${encodeURIComponent(projectId)}`);
+  } catch (err) {
+    tbody.innerHTML = `<tr><td colspan="3">${err.message}</td></tr>`;
+    return;
+  }
   if (!rows.length) { tbody.innerHTML = '<tr><td colspan="3">暂无数据</td></tr>'; return; }
   tbody.innerHTML = rows.map(m => `
     <tr><td>${KIND_LABEL[m.id_kind] || m.id_kind}</td>
@@ -258,7 +321,14 @@ async function loadMappings() {
 }
 
 async function showDetail(batchId) {
-  const b = await api(`/api/batches/${batchId}`);
+  let b;
+  try {
+    b = await api(`/api/batches/${batchId}`);
+  } catch (err) {
+    $("detail").className = "hint";
+    $("detail").textContent = err.message;
+    return;
+  }
   const files = (b.files || []).map(f =>
     `<tr><td><code>${f.archive_entry}</code></td><td>${f.original_name}</td><td>${f.size_bytes}</td></tr>`
   ).join("");
@@ -276,6 +346,94 @@ async function showDetail(batchId) {
     <tbody>${files || '<tr><td colspan="3">无</td></tr>'}</tbody></table>`;
 }
 
+// ------------------------------------------------------------------ //
+// 项目销毁
+// ------------------------------------------------------------------ //
+function destroyStateText(s) {
+  const waits = [];
+  if (s.pending_conversions) waits.push(`${s.pending_conversions} 个转换`);
+  if (s.pending_downloads) waits.push(`${s.pending_downloads} 个下载`);
+  if (s.status === "DESTROYED") return "已完成：项目影像、批次与映射已永久删除";
+  return waits.length
+    ? `销毁中：等待 ${waits.join("、")} 退出后删除数据…`
+    : "销毁中：正在删除 ZIP、暂存、批次与映射…";
+}
+
+function renderDestroyProgress(s) {
+  const el = $("destroyProgress");
+  el.style.display = "block";
+  el.innerHTML =
+    `<span class="pill ${s.status}">${s.status}</span> ` +
+    `<strong>${destroyStateText(s)}</strong>` +
+    `<div class="hint">项目 ID：<code>${s.project_id}</code> · 受理于 ${s.requested_at}` +
+    (s.finished_at ? ` · 完成于 ${s.finished_at}` : "") +
+    (s.attempts ? ` · 删除重试 ${s.attempts} 次` : "") +
+    (s.last_error ? ` · 最近错误：${s.last_error}` : "") + `</div>`;
+}
+
+function startDestroyPolling(projectId) {
+  if (destroyPollers[projectId]) return;
+  destroyPollers[projectId] = setInterval(async () => {
+    try {
+      const s = await api(`/api/projects/${projectId}/destroy`);
+      renderDestroyProgress(s);
+      loadDestructions();
+      if (s.status === "DESTROYED") {
+        clearInterval(destroyPollers[projectId]);
+        delete destroyPollers[projectId];
+        await loadProjects("project");
+        await loadBatches();
+        loadMappings();
+      }
+    } catch (err) { /* 进度查询失败时下一轮再试 */ }
+  }, 1000);
+}
+
+$("destroyBtn").addEventListener("click", async () => {
+  const p = currentProject();
+  if (!p) return;
+  if (!p.destruction_status &&
+      !confirm(`确定永久销毁项目「${p.name}」？\n\n将删除该项目全部 ZIP、暂存、批次与标识映射，仅保留项目 ID 与销毁状态。此操作不可撤销！`)) {
+    return;
+  }
+  $("destroyBtn").disabled = true;
+  try {
+    // 重复请求幂等跟随同一次销毁；请求发出后断连也不影响后台销毁
+    const s = await api(`/api/projects/${p.id}/destroy`, { method: "POST" });
+    renderDestroyProgress(s);
+    startDestroyPolling(p.id);
+    await loadProjects("project");
+    await loadDestructions();
+    await loadBatches();
+    loadMappings();
+  } catch (err) {
+    showMsg($("uploadMsg"), false, "销毁受理失败：" + err.message);
+  } finally {
+    $("destroyBtn").disabled = false;
+  }
+});
+
+async function loadDestructions() {
+  let rows;
+  try {
+    rows = await api("/api/destructions");
+  } catch (err) { return; }
+  const tbody = $("destructionRows");
+  if (!rows.length) { tbody.innerHTML = '<tr><td colspan="6">暂无销毁记录</td></tr>'; return; }
+  tbody.innerHTML = rows.map(s => `
+    <tr>
+      <td>${s.project_name}<div class="hint"><code>${s.project_id}</code></div></td>
+      <td><span class="pill ${s.status}">${s.status}</span></td>
+      <td>${s.requested_at}</td>
+      <td>${s.finished_at || "—"}</td>
+      <td>${s.status === "DESTROYING"
+        ? `转换 ${s.pending_conversions} / 下载 ${s.pending_downloads}` : "—"}</td>
+      <td>${s.attempts ? `重试 ${s.attempts} 次` : ""}${s.last_error ? `<div class="hint">${s.last_error}</div>` : ""}</td>
+    </tr>`).join("");
+}
+$("refreshDestroyBtn").addEventListener("click", loadDestructions);
+setInterval(loadDestructions, 2000);
+
 document.querySelectorAll(".tabs button").forEach(btn => btn.addEventListener("click", () => {
   document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
@@ -288,12 +446,16 @@ $("refreshBtn").addEventListener("click", () => {
   loadBatches();
   if ($("mappingsView").style.display !== "none") loadMappings();
 });
-$("project").addEventListener("change", () => { loadBatches(); loadMappings(); });
+$("project").addEventListener("change", () => { updateDestroyGate(); loadBatches(); loadMappings(); });
 
 (async function init() {
   await loadMeta();
   await loadProjects("project");
   await loadBatches();
+  await loadDestructions();
+  // 若当前项目已在销毁中，继续轮询其进度（例如刷新页面后）
+  const p = currentProject();
+  if (p && p.destruction_status) startDestroyPolling(p.id);
 })();
 </script>
 </body>

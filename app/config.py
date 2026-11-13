@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -11,14 +11,43 @@ def _int_env(name: str, default: int) -> int:
     return int(raw) if raw not in (None, "") else default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    return float(raw) if raw not in (None, "") else default
+
+
 @dataclass(frozen=True)
 class Settings:
-    data_dir: Path = Path(os.environ.get("DICOM_REMAP_DATA", "/data"))
-    max_files: int = _int_env("DICOM_REMAP_MAX_FILES", 20)
+    # 注意：必须使用 default_factory——普通默认值在类定义时即固化，
+    # 会导致 reload_settings() 无法读到新的环境变量。
+    data_dir: Path = field(
+        default_factory=lambda: Path(os.environ.get("DICOM_REMAP_DATA", "/data"))
+    )
+    max_files: int = field(default_factory=lambda: _int_env("DICOM_REMAP_MAX_FILES", 20))
     # 16 MiB
-    max_total_bytes: int = _int_env("DICOM_REMAP_MAX_TOTAL_BYTES", 16 * 1024 * 1024)
+    max_total_bytes: int = field(
+        default_factory=lambda: _int_env("DICOM_REMAP_MAX_TOTAL_BYTES", 16 * 1024 * 1024)
+    )
     # 并发批次等待对端提交/放弃的最长轮询时间（秒）
-    lock_wait_seconds: int = _int_env("DICOM_REMAP_LOCK_WAIT", 60)
+    lock_wait_seconds: int = field(
+        default_factory=lambda: _int_env("DICOM_REMAP_LOCK_WAIT", 60)
+    )
+    # 销毁线程删除失败后的重试间隔（秒）
+    destroy_retry_seconds: float = field(
+        default_factory=lambda: _float_env("DICOM_REMAP_DESTROY_RETRY_SECONDS", 2.0)
+    )
+    # 演示钩子：转换阶段每份文件前额外休眠秒数（0 = 关闭），用于演示“慢转换期间销毁”
+    slow_convert_seconds: float = field(
+        default_factory=lambda: _float_env("DICOM_REMAP_SLOW_CONVERT_SECONDS", 0.0)
+    )
+    # 演示钩子：下载流每个分块前额外休眠秒数（0 = 关闭），用于演示“慢下载期间销毁”
+    slow_download_chunk_seconds: float = field(
+        default_factory=lambda: _float_env("DICOM_REMAP_SLOW_DOWNLOAD_CHUNK_SECONDS", 0.0)
+    )
+    # 下载流分块大小（字节）
+    download_chunk_bytes: int = field(
+        default_factory=lambda: _int_env("DICOM_REMAP_DOWNLOAD_CHUNK_BYTES", 64 * 1024)
+    )
     db_filename: str = "registry.db"
 
     @property

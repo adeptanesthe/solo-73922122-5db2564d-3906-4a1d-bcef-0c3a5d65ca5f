@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -147,6 +148,10 @@ def process_batch(project_id: str, files: list[UploadedFile]) -> str:
     total_out = 0
     try:
         for parsed in parsed_files:
+            if settings.slow_convert_seconds > 0:
+                # 演示钩子（DICOM_REMAP_SLOW_CONVERT_SECONDS）：人为拉长转换窗口，
+                # 用于演示“慢转换期间发起销毁，在途转换不得发布”。
+                time.sleep(settings.slow_convert_seconds)
             encoded = remap_to_bytes(parsed, mapping)
             entry = safe_filename(parsed.filename)
             out_path = work_dir / entry

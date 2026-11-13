@@ -70,9 +70,26 @@ CREATE INDEX IF NOT EXISTS idx_mappings_lookup
     ON id_mappings(project_id, id_kind, source_value);
 CREATE INDEX IF NOT EXISTS idx_mappings_batch ON id_mappings(created_batch_id);
 CREATE INDEX IF NOT EXISTS idx_batches_project ON batches(project_id);
+
+-- 项目销毁墓碑：项目研究数据（ZIP/暂存/批次/映射）物理删除后，
+-- 仅保留本表中的项目 ID、名称与销毁状态等审计元数据；
+-- 名称同时用于启动种子守卫，保证已销毁的种子项目重启后不被重建。
+CREATE TABLE IF NOT EXISTS destructions (
+    project_id   TEXT PRIMARY KEY,
+    project_name TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('DESTROYING','DESTROYED')),
+    requested_at TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at  TEXT,
+    last_error   TEXT,
+    attempts     INTEGER NOT NULL DEFAULT 0
+);
 """
 
 SEED_PROJECTS = ("肺癌筛查研究", "脑卒中影像队列")
+
+
+class ProjectDestroyedError(RuntimeError):
+    """项目已受理销毁：拒绝新的上传/映射保留/发布/下载。"""
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -109,6 +126,12 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         with transaction(conn) as tx:
             for name in SEED_PROJECTS:
+                # 种子守卫：已销毁（含销毁中）的项目永不重建
+                destroyed = tx.execute(
+                    "SELECT 1 FROM destructions WHERE project_name = ?", (name,)
+                ).fetchone()
+                if destroyed:
+                    continue
                 tx.execute(
                     "INSERT OR IGNORE INTO projects(id, name) VALUES (?, ?)",
                     (str(uuid.uuid4()), name),
@@ -121,7 +144,12 @@ def init_db() -> None:
 # 项目
 # --------------------------------------------------------------------------- #
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    """项目列表，附带销毁状态（DESTROYING 的项目仍可见但已只读墓碑化）。"""
+    return conn.execute(
+        "SELECT p.*, d.status AS destruction_status "
+        "FROM projects p LEFT JOIN destructions d ON d.project_id = p.id "
+        "ORDER BY p.name"
+    ).fetchall()
 
 
 def get_project(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:
@@ -175,6 +203,14 @@ def reserve_mappings(
     while True:
         blocked: list[tuple[str, str]] = []
         with transaction(conn):
+            # 销毁闸门（数据库级原子）：项目一旦受理销毁，拒绝任何新的映射保留，
+            # 保证销毁后不会再出现新的批次/映射行（不留迟到产物）。
+            if conn.execute(
+                "SELECT 1 FROM destructions WHERE project_id=?", (project_id,)
+            ).fetchone():
+                raise ProjectDestroyedError(
+                    "项目已受理销毁，拒绝新的上传与映射保留"
+                )
             conn.execute(
                 "INSERT INTO batches(id, project_id, status, file_count, total_bytes) "
                 "VALUES (?, ?, 'PENDING', 0, 0) "
@@ -251,8 +287,20 @@ def publish_batch(
     zip_name: str,
     total_bytes: int,
 ) -> None:
-    """原子发布：本批次 + 本批次新建 PENDING 映射一起转 PUBLISHED。"""
+    """原子发布：本批次 + 本批次新建 PENDING 映射一起转 PUBLISHED。
+
+    销毁闸门：与发布同事务检查项目销毁状态——受理销毁前就已开始的转换
+    在此被拦截，绝不发布（调用方负责回收本批 PENDING 映射与暂存/ZIP）。
+    """
     with transaction(conn):
+        if conn.execute(
+            "SELECT 1 FROM destructions d "
+            "JOIN batches b ON b.project_id = d.project_id WHERE b.id=?",
+            (batch_id,),
+        ).fetchone():
+            raise ProjectDestroyedError(
+                "项目已受理销毁，进行中的批次不得发布，已回滚"
+            )
         conn.execute(
             "UPDATE batches SET status='PUBLISHED', zip_name=?, file_count=?, "
             "total_bytes=?, published_at=datetime('now') WHERE id=?",
@@ -319,13 +367,23 @@ def recover_pending(conn: sqlite3.Connection) -> list[str]:
 # --------------------------------------------------------------------------- #
 # 查询
 # --------------------------------------------------------------------------- #
+# 销毁中的项目：批次与映射对外不可见（受理即隐藏，不等物理删除完成）
+_NOT_DESTROYING = (
+    "NOT EXISTS (SELECT 1 FROM destructions d WHERE d.project_id = {t}.project_id)"
+)
+
+
 def list_batches(conn: sqlite3.Connection, project_id: str | None = None) -> list[sqlite3.Row]:
+    hidden = _NOT_DESTROYING.format(t="batches")
     if project_id:
         return conn.execute(
-            "SELECT * FROM batches WHERE project_id=? ORDER BY created_at DESC",
+            f"SELECT * FROM batches WHERE project_id=? AND {hidden} "
+            "ORDER BY created_at DESC",
             (project_id,),
         ).fetchall()
-    return conn.execute("SELECT * FROM batches ORDER BY created_at DESC").fetchall()
+    return conn.execute(
+        f"SELECT * FROM batches WHERE {hidden} ORDER BY created_at DESC"
+    ).fetchall()
 
 
 def get_batch(conn: sqlite3.Connection, batch_id: str) -> sqlite3.Row | None:
@@ -341,12 +399,109 @@ def list_batch_files(conn: sqlite3.Connection, batch_id: str) -> list[sqlite3.Ro
 def list_mappings(
     conn: sqlite3.Connection, project_id: str | None = None
 ) -> list[sqlite3.Row]:
+    hidden = _NOT_DESTROYING.format(t="id_mappings")
     if project_id:
         return conn.execute(
-            "SELECT * FROM id_mappings WHERE project_id=? AND status='PUBLISHED' "
-            "ORDER BY id",
+            f"SELECT * FROM id_mappings WHERE project_id=? AND status='PUBLISHED' "
+            f"AND {hidden} ORDER BY id",
             (project_id,),
         ).fetchall()
     return conn.execute(
-        "SELECT * FROM id_mappings WHERE status='PUBLISHED' ORDER BY id"
+        f"SELECT * FROM id_mappings WHERE status='PUBLISHED' AND {hidden} ORDER BY id"
     ).fetchall()
+
+
+# --------------------------------------------------------------------------- #
+# 项目销毁
+# --------------------------------------------------------------------------- #
+def is_project_destroying(conn: sqlite3.Connection, project_id: str) -> bool:
+    """项目是否已受理销毁（DESTROYING 或 DESTROYED 均为 True）。"""
+    return (
+        conn.execute(
+            "SELECT 1 FROM destructions WHERE project_id=?", (project_id,)
+        ).fetchone()
+        is not None
+    )
+
+
+def get_destruction(conn: sqlite3.Connection, project_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM destructions WHERE project_id=?", (project_id,)
+    ).fetchone()
+
+
+def list_destructions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM destructions ORDER BY requested_at DESC"
+    ).fetchall()
+
+
+def list_active_destructions(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """启动恢复用：所有仍处于 DESTROYING 的销毁记录。"""
+    return conn.execute(
+        "SELECT * FROM destructions WHERE status='DESTROYING'"
+    ).fetchall()
+
+
+def accept_destruction(
+    conn: sqlite3.Connection, project_id: str, project_name: str
+) -> sqlite3.Row:
+    """受理销毁：幂等登记 DESTROYING 记录（重复请求跟随同一次销毁）。
+
+    调用方须持有进程级许可锁（app.destroy.permit_lock），使“受理”与
+    “放行新上传/下载”互斥，杜绝受理瞬间漏计在途操作的竞态。
+    """
+    with transaction(conn):
+        conn.execute(
+            "INSERT OR IGNORE INTO destructions(project_id, project_name, status) "
+            "VALUES (?, ?, 'DESTROYING')",
+            (project_id, project_name),
+        )
+        row = conn.execute(
+            "SELECT * FROM destructions WHERE project_id=?", (project_id,)
+        ).fetchone()
+    return row
+
+
+def note_destroy_failure(
+    conn: sqlite3.Connection, project_id: str, error: str
+) -> None:
+    """删除失败：保持 DESTROYING，记录错误并累计尝试次数（供重试与展示）。"""
+    with transaction(conn):
+        conn.execute(
+            "UPDATE destructions SET attempts=attempts+1, last_error=? "
+            "WHERE project_id=? AND status='DESTROYING'",
+            (error[:500], project_id),
+        )
+
+
+def batch_ids_for_project(conn: sqlite3.Connection, project_id: str) -> list[str]:
+    rows = conn.execute(
+        "SELECT id FROM batches WHERE project_id=?", (project_id,)
+    ).fetchall()
+    return [r["id"] for r in rows]
+
+
+def finish_destruction(conn: sqlite3.Connection, project_id: str) -> None:
+    """终态事务：删除项目全部批次/文件清单/映射与项目行，标记 DESTROYED。
+
+    调用前必须已完成：在途转换退出、在途下载关闭、项目 ZIP 与暂存删除。
+    本事务只删行，不做文件操作，写锁毫秒级。
+    """
+    with transaction(conn):
+        conn.execute(
+            "DELETE FROM batch_files WHERE batch_id IN "
+            "(SELECT id FROM batches WHERE project_id=?)",
+            (project_id,),
+        )
+        conn.execute("DELETE FROM id_mappings WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM batches WHERE project_id=?", (project_id,))
+        conn.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        cur = conn.execute(
+            "UPDATE destructions SET status='DESTROYED', "
+            "finished_at=datetime('now'), last_error=NULL "
+            "WHERE project_id=? AND status='DESTROYING'",
+            (project_id,),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(f"销毁记录状态异常，无法标记完成: {project_id}")
